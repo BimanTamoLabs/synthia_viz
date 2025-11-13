@@ -343,14 +343,14 @@ def hypothesis_testing_tab():
     filtered = st.session_state.get("eeg_df_filtered")
     hypothesis_table = st.session_state.get("hypothesis_table_df")
     timings = st.session_state.get("phase_timings")
+    hrv_df = st.session_state.get("hrv_df")
 
     if eeg_df is None or hypothesis_table is None:
         st.info("Upload hypothesis table and ensure EEG data is loaded.")
         return
 
     st.subheader("Hypothesis Testing")
-    data_source = filtered if st.session_state["use_filtered_for_hypothesis"] and filtered is not None else eeg_df
-    st.caption(f"Using {'filtered' if data_source is filtered else 'raw'} EEG dataset for evaluation.")
+    eeg_source = filtered if st.session_state["use_filtered_for_hypothesis"] and filtered is not None else eeg_df
 
     categories = hypothesis_table["Category"].unique().tolist()
     selected_category = st.selectbox("Select category", categories)
@@ -368,12 +368,34 @@ def hypothesis_testing_tab():
 
     if st.button("Run Hypothesis Test"):
         with st.spinner("Evaluating hypothesis..."):
-            result = hypothesis_engine.evaluate_hypothesis(
-                data_source,
-                selected_row,
-                phase_column=PHASE_COLUMN,
-                mode=st.session_state["hypothesis_mode"],
-            )
+            evaluation_sources = []
+            if eeg_source is not None:
+                label = "filtered EEG dataset" if eeg_source is filtered else "raw EEG dataset"
+                evaluation_sources.append((eeg_source, label))
+            if hrv_df is not None:
+                evaluation_sources.append((hrv_df, "HRV dataset"))
+
+            result = None
+            used_label = None
+            last_error = None
+            for candidate_df, label in evaluation_sources:
+                try:
+                    result = hypothesis_engine.evaluate_hypothesis(
+                        candidate_df,
+                        selected_row,
+                        phase_column=PHASE_COLUMN,
+                        mode=st.session_state["hypothesis_mode"],
+                    )
+                    used_label = label
+                    break
+                except KeyError as err:
+                    last_error = err
+                    continue
+
+            if result is None:
+                raise last_error if last_error else RuntimeError("Unable to evaluate hypothesis with available datasets.")
+
+            st.caption(f"Using {used_label} for evaluation.")
             st.json({k: v for k, v in result.items() if k not in {"metric_values"}})
             metric_values = result["metric_values"]
             if isinstance(metric_values, pd.Series) and not metric_values.empty:
