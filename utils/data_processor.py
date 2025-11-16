@@ -121,13 +121,27 @@ def load_hrv_json_to_df(json_source: Union[str, Path, dict, bytes]) -> pd.DataFr
     def _coerce_timestamp(value):
         if value is None:
             return pd.NaT
-        # Handle numeric-like strings
         if isinstance(value, str):
             stripped = value.strip()
+            if not stripped:
+                return pd.NaT
             if stripped.isdigit():
                 value = int(stripped)
+            else:
+                return pd.to_datetime(stripped, errors="coerce")
         if isinstance(value, (int, float)):
-            return pd.to_datetime(value, unit="ms", errors="coerce")
+            magnitude = abs(int(value))
+            if magnitude >= 10**15:
+                unit = "ns"
+            elif magnitude >= 10**12:
+                unit = "ms"
+            elif magnitude >= 10**9:
+                unit = "s"
+            elif magnitude >= 10**6:
+                unit = "ms"
+            else:
+                unit = "s"
+            return pd.to_datetime(value, unit=unit, errors="coerce")
         return pd.to_datetime(value, errors="coerce")
 
     for detail in payload.get("details", []):
@@ -137,15 +151,43 @@ def load_hrv_json_to_df(json_source: Union[str, Path, dict, bytes]) -> pd.DataFr
             if not raw:
                 continue
             raw_entries = raw if isinstance(raw, list) else [raw]
+            start_reference = None
+            for key in ("startTime", "start_time", "startTimestamp", "start_datetime", "startDateTime"):
+                if key in detail:
+                    start_reference = _coerce_timestamp(detail.get(key))
+                    if not pd.isna(start_reference):
+                        break
+
             for entry in raw_entries:
                 row = dict(entry)
                 row["testType"] = phase
-                timestamp_value = metric.get("on")
-                if timestamp_value is None:
-                    timestamp_value = entry.get("time")
+
+                timestamp_value = None
+                for container in (metric, entry):
+                    if not isinstance(container, dict):
+                        continue
+                    for key in ("on", "timestamp", "Timestamp", "timeStamp", "time", "Time", "datetime", "dateTime"):
+                        candidate = container.get(key)
+                        if candidate not in (None, ""):
+                            timestamp_value = candidate
+                            break
+                    if timestamp_value is not None:
+                        break
+                timestamp_raw = timestamp_value
                 timestamp = _coerce_timestamp(timestamp_value)
-                if pd.isna(timestamp) and entry.get("time") is not None:
-                    timestamp = _coerce_timestamp(entry.get("time"))
+                if timestamp_value not in (None, ""):
+                    if (pd.isna(timestamp) or (isinstance(timestamp, pd.Timestamp) and timestamp.year <= 1971)):
+                        try:
+                            numeric_val = float(timestamp_value)
+                        except (ValueError, TypeError):
+                            numeric_val = None
+                        if numeric_val is not None:
+                            if start_reference is not None and not pd.isna(start_reference):
+                                unit = "ms" if abs(numeric_val) >= 1000 else "s"
+                                timestamp = start_reference + pd.to_timedelta(numeric_val, unit=unit)
+                            else:
+                                timestamp = pd.NaT
+                row["timestamp_raw"] = timestamp_raw
                 row["timestamp"] = timestamp
                 records.append(row)
 
