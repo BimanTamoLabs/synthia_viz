@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
 import pandas as pd
@@ -25,6 +26,11 @@ def initialise_session_state() -> None:
         "hypothesis_mode": "aggregated",
         "use_filtered_for_hypothesis": True,
         "consciousness_weights": {"CSI": 0.4, "EMG": 0.2, "SQI": 0.2, "BS": 0.2},
+        "sample_eeg_raw": None,
+        "sample_eeg_parsed": None,
+        "sample_hrv": None,
+        "sample_phase_timings": None,
+        "sample_eeg_labeled": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -401,13 +407,17 @@ def hypothesis_testing_tab():
             if isinstance(metric_values, pd.Series) and not metric_values.empty:
                 st.plotly_chart(charts.plot_metric_histogram(metric_values, selected_row), use_container_width=True)
 
+    batch_source = eeg_source if eeg_source is not None else hrv_df
     with st.expander("Batch Evaluation"):
         selected_categories = st.multiselect("Select categories", categories)
         if st.button("Run Batch Evaluation"):
             with st.spinner("Evaluating hypotheses in batch..."):
+                if batch_source is None:
+                    st.error("No dataset available for batch evaluation.")
+                    return
                 ids = hypothesis_table[hypothesis_table["Category"].isin(selected_categories)]["Hypothesis_ID"].tolist()
                 batch_results = hypothesis_engine.batch_evaluate_hypotheses(
-                    data_source,
+                    batch_source,
                     hypothesis_table,
                     hypothesis_ids=ids,
                     phase_column=PHASE_COLUMN,
@@ -426,6 +436,74 @@ def hypothesis_testing_tab():
                     ]
                 )
                 st.dataframe(summary_df)
+
+
+def sample_debug_section():
+    st.subheader("Sample Data Debug")
+    base_path = Path(__file__).resolve().parent
+    sample_eeg_path = base_path / "5900128102516_EEG.csv"
+    sample_hrv_path = base_path / "5900128102516_HRV.json"
+
+    st.caption(f"EEG sample path: `{sample_eeg_path}` {'✅' if sample_eeg_path.exists() else '❌'}")
+    st.caption(f"HRV sample path: `{sample_hrv_path}` {'✅' if sample_hrv_path.exists() else '❌'}")
+
+    load_cols = st.columns(2)
+    with load_cols[0]:
+        if st.button("Load Sample EEG", key="load_sample_eeg") and sample_eeg_path.exists():
+            raw_df = pd.read_csv(sample_eeg_path)
+            parsed_df = data_loader.load_eeg_file(sample_eeg_path)
+            st.session_state["sample_eeg_raw"] = raw_df
+            st.session_state["sample_eeg_parsed"] = parsed_df
+            st.session_state["sample_phase_timings"] = None
+            st.session_state["sample_eeg_labeled"] = None
+            st.success(f"Loaded sample EEG with {len(parsed_df)} rows.")
+        elif not sample_eeg_path.exists():
+            st.error("Sample EEG file not found.")
+    with load_cols[1]:
+        if st.button("Load Sample HRV", key="load_sample_hrv") and sample_hrv_path.exists():
+            with open(sample_hrv_path, "r") as fp:
+                payload = json.load(fp)
+            hrv_df = data_processor.load_hrv_json_to_df(payload)
+            st.session_state["sample_hrv"] = hrv_df
+            st.session_state["sample_phase_timings"] = None
+            st.session_state["sample_eeg_labeled"] = None
+            st.success(f"Loaded sample HRV with {len(hrv_df)} rows.")
+        elif not sample_hrv_path.exists():
+            st.error("Sample HRV file not found.")
+
+    raw_df = st.session_state.get("sample_eeg_raw")
+    parsed_df = st.session_state.get("sample_eeg_parsed")
+    hrv_df = st.session_state.get("sample_hrv")
+
+    if raw_df is not None:
+        st.markdown("#### Raw EEG Timestamp Column (first 10 rows)")
+        first_col_name = raw_df.columns[0]
+        st.dataframe(raw_df[[first_col_name]].head(10), use_container_width=True)
+
+    if parsed_df is not None:
+        st.markdown("#### Parsed EEG Timestamp Column (first 10 rows)")
+        st.dataframe(parsed_df[["Timestamp"]].head(10), use_container_width=True)
+
+    if parsed_df is not None and hrv_df is not None:
+        if st.button("Align Sample Datasets", key="align_sample_data"):
+            timings = data_processor.get_testType_timings(hrv_df)
+            if timings.empty:
+                st.error("Unable to compute HRV phase timings for sample data.")
+            else:
+                labeled = alignment.assign_hrv_testTypes_to_eeg(parsed_df.copy(), timings, phase_column=PHASE_COLUMN)
+                st.session_state["sample_phase_timings"] = timings
+                st.session_state["sample_eeg_labeled"] = labeled
+                st.success("Sample EEG aligned with HRV phases.")
+
+    timings = st.session_state.get("sample_phase_timings")
+    labeled = st.session_state.get("sample_eeg_labeled")
+    if timings is not None and labeled is not None:
+        st.markdown("#### Sample Phase Timings")
+        st.dataframe(timings, use_container_width=True)
+        counts = labeled[PHASE_COLUMN].value_counts().reindex(PHASE_ORDER, fill_value=0)
+        st.markdown("#### Sample Phase Counts")
+        st.dataframe(counts.to_frame(name="Rows"), use_container_width=True)
+        st.plotly_chart(charts.plot_phase_count_bar(counts, title="Sample EEG Samples per Phase"), use_container_width=True)
 
 
 def export_tab():
@@ -482,6 +560,10 @@ def main():
         hypothesis_testing_tab()
     with tabs[4]:
         export_tab()
+
+    debug_tab = st.expander("Sample Data Debug", expanded=False)
+    with debug_tab:
+        sample_debug_section()
 
 
 if __name__ == "__main__":

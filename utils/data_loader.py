@@ -140,21 +140,88 @@ def load_eeg_file(
     Load an EEG CSV file and ensure the Timestamp column exists.
     """
     if isinstance(file_source, (str, Path)):
-        df = pd.read_csv(_normalise_path(file_source))
+        raw_text = Path(file_source).read_text(encoding="utf-8")
+    elif isinstance(file_source, BytesIO):
+        raw_text = file_source.getvalue().decode("utf-8")
+        file_source.seek(0)
+    elif isinstance(file_source, StringIO):
+        raw_text = file_source.getvalue()
+        file_source.seek(0)
     else:
-        df = pd.read_csv(file_source)
+        raw_text = str(file_source)
 
-    first_col = df.columns[0]
-    if first_col != "Timestamp":
-        df = df.rename(columns={first_col: "Timestamp"})
+    lines = [line.rstrip("\n") for line in raw_text.splitlines() if line.strip()]
+    if not lines:
+        raise ValueError("EEG file appears to be empty.")
 
-    df["Timestamp"] = pd.to_datetime(
+    header = [col.strip() for col in lines[0].lstrip("\t").replace("\t", "").split(",")]
+    data_rows: List[List[str]] = []
+    expected_cols = len(header)
+
+    for line in lines[1:]:
+        cleaned = line.lstrip("\t").replace("\t", "")
+        parts = [part.strip() for part in cleaned.split(",")]
+        if not parts:
+            continue
+        if len(parts) >= expected_cols:
+            base = parts[: expected_cols - 1]
+            eeg_part = ",".join(parts[expected_cols - 1 :])
+            base.append(eeg_part)
+            parts = base
+        else:
+            parts.extend([""] * (expected_cols - len(parts)))
+        data_rows.append(parts[:expected_cols])
+
+    df = pd.DataFrame(data_rows, columns=header)
+
+    # Normalise column labels to make matching easier (e.g. "时间", " Timestamp ")
+    df.columns = [str(col).strip() for col in df.columns]
+
+    candidate_names = [name for name in ("Timestamp", "时间", "Time", "time", "Datetime", "datetime") if name in df.columns]
+    if candidate_names:
+        timestamp_col = candidate_names[0]
+    else:
+        timestamp_col = df.columns[0]
+
+    if timestamp_col != "Timestamp":
+        df = df.rename(columns={timestamp_col: "Timestamp"})
+    print(f"[EEG Loader] Timestamp column resolved: '{timestamp_col}' -> 'Timestamp'")
+
+    def _clean_timestamp_cell(value):
+        if value is None:
+            return ""
+        text = str(value).strip()
+        text = text.replace("\t", " ")
+        if "," in text:
+            text = text.split(",", 1)[0]
+        parts = text.split()
+        if len(parts) >= 2:
+            text = f"{parts[0]} {parts[1]}"
+        elif parts:
+            text = parts[0]
+        else:
+            text = ""
+        return text
+
+    df["Timestamp"] = df["Timestamp"].apply(_clean_timestamp_cell)
+
+    parsed = pd.to_datetime(
         df["Timestamp"],
         format=timestamp_format,
         errors="coerce",
+        infer_datetime_format=True,
     )
-    if df["Timestamp"].isna().all():
-        raise ValueError("Failed to parse any timestamps in EEG file.")
+    if parsed.notna().any():
+        df["Timestamp"] = parsed
+        print("[EEG Loader] Parsed timestamps (first 5 rows):")
+        print(df[["Timestamp"]].head())
+    else:
+        sample = df["Timestamp"].head(5).tolist()
+        raise ValueError(f"Failed to parse any timestamps in EEG file. Sample values: {sample}")
+
+    for col in df.columns:
+        if col not in {"Timestamp", "EEG"}:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
 
     if "SQI" not in df.columns:
         raise ValueError("EEG file missing required 'SQI' column.")
